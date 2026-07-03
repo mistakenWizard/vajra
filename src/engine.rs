@@ -93,6 +93,7 @@ pub struct BacktestEngine {
     pub params: FinancialParams,
     position: Option<Trade>,
     trades: Vec<Trade>,
+    cost: Box<dyn crate::cost::CostModel>,
 }
 
 impl BacktestEngine {
@@ -102,6 +103,17 @@ impl BacktestEngine {
             params: FinancialParams::default(),
             position: None,
             trades: Vec::new(),
+            cost: Box::new(crate::cost::IndiaOptionsCost),
+        }
+    }
+
+    pub fn with_cost(initial_capital: f64, cost: Box<dyn crate::cost::CostModel>) -> Self {
+        Self {
+            capital: initial_capital,
+            params: FinancialParams::default(),
+            position: None,
+            trades: Vec::new(),
+            cost,
         }
     }
 
@@ -275,20 +287,12 @@ impl BacktestEngine {
                     greeks.price
                 };
 
-                // Slippage: 0.5 points per leg for options, 0.05% for equity
-                if signal_leg.option_type == "EQ" {
-                    if signal_leg.action == "SELL" {
-                        entry_price -= price * 0.0005;
-                    } else {
-                        entry_price += price * 0.0005;
-                    }
-                } else {
-                    if signal_leg.action == "SELL" {
-                        entry_price -= 0.5;
-                    } else {
-                        entry_price += 0.5;
-                    }
-                }
+                entry_price = self.cost.adjust_fill(
+                    entry_price,
+                    &signal_leg.action,
+                    signal_leg.option_type != "EQ",
+                    false,
+                );
 
                 let calculated_leg = OptionLeg {
                     strike: signal_leg.strike,
@@ -417,24 +421,11 @@ impl BacktestEngine {
 
                     // Exit Slippage
                     if leg.option_type == "EQ" {
-                        if leg.action == "SELL" {
-                            exit_price += price * 0.0005;
-                        } else {
-                            exit_price -= price * 0.0005;
-                        } // Sell to close -> Sell, Buy to close -> Buy. Wait, leg.action is entry action.
-                          // If entry was SELL, exit is BUY -> slippage adds to price
-                          // If entry was BUY, exit is SELL -> slippage subtracts from price
-                        if leg.action == "SELL" {
-                            exit_price += price * 0.0005;
-                        } else {
-                            exit_price -= price * 0.0005;
-                        }
+                        // vajra: preserves double-slippage bug from source; fix post-extraction
+                        exit_price = self.cost.adjust_fill(exit_price, &leg.action, false, true);
+                        exit_price = self.cost.adjust_fill(exit_price, &leg.action, false, true);
                     } else {
-                        if leg.action == "SELL" {
-                            exit_price += 0.5;
-                        } else {
-                            exit_price -= 0.5;
-                        }
+                        exit_price = self.cost.adjust_fill(exit_price, &leg.action, true, true);
                     }
 
                     leg.exit_price = Some(exit_price);
@@ -453,15 +444,8 @@ impl BacktestEngine {
                     * self.params.lot_size;
 
                 // Friction
-                let base_brokerage = 40.0 * (trade.legs.len() as f64 / 2.0); // 40 Rs per roundtrip spread
-                let gst = base_brokerage * 0.18; // 18% GST on brokerage
-                let total_brokerage = base_brokerage + gst;
-                let stt = if trade.entry_price > 0.0 {
-                    trade.entry_price * trade.quantity as f64 * self.params.lot_size * 0.00125
-                } else {
-                    0.0
-                };
-                let net_pnl = gross_pnl - total_brokerage - stt;
+                let costs = self.cost.round_trip_cost(&trade, self.params.lot_size);
+                let net_pnl = gross_pnl - costs;
 
                 trade.pnl = Some(net_pnl);
                 self.capital += net_pnl;
