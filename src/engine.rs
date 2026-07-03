@@ -130,6 +130,8 @@ impl BacktestEngine {
         let volumes_series = df.column("volume")?.cast(&DataType::Float64)?;
         let volumes = volumes_series.f64()?;
         let timestamps = df.column("timestamp")?.str()?;
+        // Optional per-bar implied vol; absent column falls back to the flat params IV.
+        let ivs = df.column("iv").ok().and_then(|c| c.f64().ok());
 
         for i in 0..closes.len() {
             let close = closes.get(i).unwrap();
@@ -138,6 +140,9 @@ impl BacktestEngine {
             let low = lows.get(i).unwrap();
             let volume = volumes.get(i).unwrap();
             let ts_str = timestamps.get(i).unwrap();
+            let iv = ivs
+                .and_then(|c| c.get(i))
+                .unwrap_or(self.params.iv_assumption);
 
             let dt = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S")
                 .unwrap_or_default();
@@ -174,7 +179,7 @@ impl BacktestEngine {
                                 leg.strike,
                                 t,
                                 self.params.risk_free_rate,
-                                self.params.iv_assumption,
+                                iv,
                                 is_call,
                             );
                             greeks.price
@@ -201,22 +206,22 @@ impl BacktestEngine {
             if let Some(signal) =
                 strategy.on_bar(timestamp, open, high, low, close, volume, current_pnl)
             {
-                self.process_signal(signal, timestamp, close);
+                self.process_signal(signal, timestamp, close, iv);
             }
         }
 
         Ok(self.trades.clone())
     }
 
-    fn process_signal(&mut self, signal: Signal, timestamp: i64, price: f64) {
+    fn process_signal(&mut self, signal: Signal, timestamp: i64, price: f64, iv: f64) {
         match signal.action {
             SignalAction::Buy => self.handle_buy(timestamp, price),
             SignalAction::Sell => self.handle_sell(timestamp, price),
             SignalAction::OpenPosition {
                 legs,
                 expiry_days: _,
-            } => self.handle_open_position(timestamp, price, legs),
-            SignalAction::CloseAll => self.handle_close_all(timestamp, price),
+            } => self.handle_open_position(timestamp, price, legs, iv),
+            SignalAction::CloseAll => self.handle_close_all(timestamp, price, iv),
         }
     }
 
@@ -254,7 +259,13 @@ impl BacktestEngine {
         }
     }
 
-    fn handle_open_position(&mut self, timestamp: i64, price: f64, signal_legs: Vec<OptionLeg>) {
+    fn handle_open_position(
+        &mut self,
+        timestamp: i64,
+        price: f64,
+        signal_legs: Vec<OptionLeg>,
+        iv: f64,
+    ) {
         if self.position.is_none() {
             let mut total_net_premium = 0.0f64;
             let mut total_margin: f64 = 0.0f64;
@@ -281,7 +292,7 @@ impl BacktestEngine {
 
                     let t = days_to_expiry / 365.0;
                     let r = self.params.risk_free_rate;
-                    let sigma = self.params.iv_assumption;
+                    let sigma = iv;
 
                     let greeks = calculate_greeks(price, signal_leg.strike, t, r, sigma, is_call);
                     greeks.price
@@ -356,9 +367,12 @@ impl BacktestEngine {
                 1
             };
 
-            println!(
+            log::debug!(
                 "handle_open_position: capital={}, net_premium={}, margin_per_lot={}, quantity={}",
-                self.capital, total_net_premium, margin_per_lot, quantity
+                self.capital,
+                total_net_premium,
+                margin_per_lot,
+                quantity
             );
 
             if quantity > 0 {
@@ -373,7 +387,7 @@ impl BacktestEngine {
                     direction: "SPREAD".to_string(),
                     legs: all_legs,
                 });
-                println!(
+                log::debug!(
                     "Position opened successfully. Current position: {:?}",
                     self.position
                 );
@@ -381,15 +395,15 @@ impl BacktestEngine {
         }
     }
 
-    fn handle_close_all(&mut self, timestamp: i64, price: f64) {
-        println!(
+    fn handle_close_all(&mut self, timestamp: i64, price: f64, iv: f64) {
+        log::debug!(
             "handle_close_all: timestamp={}, price={}, position_is_some={}",
             timestamp,
             price,
             self.position.is_some()
         );
         if let Some(mut trade) = self.position.take() {
-            println!("Closing position: {:?}", trade.symbol);
+            log::debug!("Closing position: {:?}", trade.symbol);
             if trade.direction == "SPREAD" {
                 let mut current_net_premium = 0.0;
 
@@ -414,7 +428,7 @@ impl BacktestEngine {
 
                         let t = days_to_expiry / 365.0;
                         let r = self.params.risk_free_rate;
-                        let sigma = self.params.iv_assumption;
+                        let sigma = iv;
                         let greeks = calculate_greeks(price, leg.strike, t, r, sigma, is_call);
                         greeks.price
                     };
@@ -450,7 +464,7 @@ impl BacktestEngine {
                 trade.pnl = Some(net_pnl);
                 self.capital += net_pnl;
                 self.trades.push(trade);
-                println!("Trade closed and pushed. PnL: {}", net_pnl);
+                log::debug!("Trade closed and pushed. PnL: {}", net_pnl);
             } else {
                 // handle non-spread trades
                 trade.exit_price = Some(price);
@@ -459,7 +473,7 @@ impl BacktestEngine {
                 trade.pnl = Some(pnl);
                 self.capital += pnl;
                 self.trades.push(trade);
-                println!("Non-spread trade closed and pushed. PnL: {}", pnl);
+                log::debug!("Non-spread trade closed and pushed. PnL: {}", pnl);
             }
         }
     }
@@ -528,6 +542,7 @@ mod tests {
             },
             timestamp,
             price,
+            engine.params.iv_assumption,
         );
 
         assert!(engine.position.is_some());
@@ -542,6 +557,7 @@ mod tests {
             },
             timestamp + 3600,
             price - 50.0,
+            engine.params.iv_assumption,
         );
 
         assert!(engine.position.is_none());

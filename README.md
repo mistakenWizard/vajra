@@ -42,6 +42,15 @@ an optional `Signal` — `Buy`, `Sell`, `OpenPosition { legs, expiry_days }`, or
 `CloseAll`). Plug a custom `CostModel` into `BacktestEngine::with_cost` to model
 your own venue's frictions.
 
+### Implied volatility
+
+Option legs are priced with Black-Scholes, so they need a volatility input. By
+default the engine uses a single flat assumption (override it via
+`BacktestEngine::new(capital).with_params(FinancialParams { iv_assumption, .. })`).
+For realistic pricing, add an `iv` column to your bar `DataFrame` — the engine
+reads per-bar implied vol from it and only falls back to the flat assumption
+when the column is absent.
+
 ## Status
 
 **v0.1 — API unstable.** Extracted from a private trading stack and still
