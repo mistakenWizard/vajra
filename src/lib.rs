@@ -3,5 +3,6 @@ pub mod cost;
 pub mod data;
 pub mod engine;
 pub mod greeks;
+pub mod marketdata;
 pub mod reporting;
 pub mod strategies;
