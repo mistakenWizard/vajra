@@ -141,6 +141,7 @@ impl BacktestEngine {
     }
 
     pub fn run(&mut self, df: &DataFrame, strategy: &mut dyn Strategy) -> Result<Vec<Trade>> {
+        self.modeled_fills = 0;
         let closes = df.column("close")?.f64()?;
         let opens = df.column("open")?.f64()?;
         let highs = df.column("high")?.f64()?;
@@ -148,95 +149,110 @@ impl BacktestEngine {
         let volumes_series = df.column("volume")?.cast(&DataType::Float64)?;
         let volumes = volumes_series.f64()?;
         let timestamps = df.column("timestamp")?.str()?;
-        // Optional per-bar implied vol; absent column falls back to the flat params IV.
         let ivs = df.column("iv").ok().and_then(|c| c.f64().ok());
+        let n = closes.len();
 
-        for i in 0..closes.len() {
+        // A decision awaiting its fill bar (single-position engine => at most one).
+        struct Pending {
+            signal: Signal,
+            fill_bar: usize,
+        }
+        let mut pending: Option<Pending> = None;
+
+        // Resolve timestamp + underlying fill price at a given bar, per the fill model.
+        let bar_ts = |i: usize| -> i64 {
+            let dt = chrono::NaiveDateTime::parse_from_str(
+                timestamps.get(i).unwrap(),
+                "%Y-%m-%d %H:%M:%S",
+            )
+            .unwrap_or_default();
+            dt.and_utc().timestamp()
+        };
+
+        for i in 0..n {
             let close = closes.get(i).unwrap();
             let open = opens.get(i).unwrap();
             let high = highs.get(i).unwrap();
             let low = lows.get(i).unwrap();
             let volume = volumes.get(i).unwrap();
-            let ts_str = timestamps.get(i).unwrap();
             let iv = ivs
                 .and_then(|c| c.get(i))
                 .unwrap_or(self.params.iv_assumption);
 
-            let dt = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S")
-                .unwrap_or_default();
-            let timestamp = dt.and_utc().timestamp();
+            // (A) Execute a pending fill scheduled for this bar, before the strategy sees it.
+            if pending.as_ref().is_some_and(|p| p.fill_bar == i) {
+                let p = pending.take().unwrap();
+                let fill_px = self.fill_underlying_px(i, open, high, low, close);
+                self.process_signal(p.signal, bar_ts(i), fill_px, iv);
+            }
 
-            // Calculate current unrealized PnL if a position is open
-            let current_pnl = if let Some(ref trade) = self.position {
-                let _pnl = 0.0;
-                if trade.direction == "SPREAD" {
-                    let mut current_value = 0.0;
+            // (B) Mark unrealized PnL against this bar's close (unchanged behavior).
+            let timestamp = bar_ts(i);
+            let current_pnl = self.mark_current_pnl(close, timestamp, iv);
 
-                    for leg in &trade.legs {
-                        let greeks_price = if leg.option_type == "EQ" {
-                            close
-                        } else {
-                            let is_call = leg.option_type == "CE";
-                            use chrono::Datelike;
-                            let dt = chrono::DateTime::from_timestamp(timestamp, 0)
-                                .unwrap_or_default()
-                                .naive_utc();
-                            let mut days_to_expiry = 0.0;
-                            let mut current_date = dt.date();
-                            while current_date.weekday() != chrono::Weekday::Thu {
-                                current_date = current_date.succ_opt().unwrap();
-                                days_to_expiry += 1.0;
-                            }
-                            if days_to_expiry == 0.0 {
-                                days_to_expiry = 0.1;
-                            }
-
-                            let t = days_to_expiry / 365.0;
-                            let greeks = calculate_greeks(
-                                close,
-                                leg.strike,
-                                t,
-                                self.params.risk_free_rate,
-                                iv,
-                                is_call,
-                            );
-                            greeks.price
-                        };
-
-                        if leg.action == "SELL" {
-                            current_value += greeks_price;
-                        } else {
-                            current_value -= greeks_price;
-                        }
-                    }
-                    Some(
-                        (trade.entry_price - current_value)
-                            * trade.quantity as f64
-                            * self.params.lot_size,
-                    )
-                } else {
-                    Some((close - trade.entry_price) * trade.quantity as f64)
-                }
-            } else {
-                None
-            };
-
-            // Underlying price the fill model marks against (SameBarClose => close, today's behavior).
-            let fill_px = match self.fill_model.underlying_field() {
-                BarField::Open => open,
-                BarField::High => high,
-                BarField::Low => low,
-                BarField::Close => close,
-            };
-
+            // (C) Ask the strategy; schedule any new decision at its fill bar.
             if let Some(signal) =
                 strategy.on_bar(timestamp, open, high, low, close, volume, current_pnl)
             {
-                self.process_signal(signal, timestamp, fill_px, iv);
+                let fb = self.fill_model.fill_bar(i);
+                if fb >= n {
+                    // ponytail: last-bar decision has no forward bar to fill at; drop it
+                    // rather than fill same-bar (which would be lookahead).
+                    log::debug!("decision on final bar {i} dropped (no fill bar)");
+                } else if fb == i {
+                    let fill_px = self.fill_underlying_px(i, open, high, low, close);
+                    self.process_signal(signal, timestamp, fill_px, iv);
+                } else {
+                    pending = Some(Pending {
+                        signal,
+                        fill_bar: fb,
+                    });
+                }
             }
         }
 
         Ok(self.trades.clone())
+    }
+
+    fn fill_underlying_px(&self, _i: usize, open: f64, high: f64, low: f64, close: f64) -> f64 {
+        match self.fill_model.underlying_field() {
+            BarField::Open => open,
+            BarField::High => high,
+            BarField::Low => low,
+            BarField::Close => close,
+        }
+    }
+
+    fn mark_current_pnl(&self, close: f64, timestamp: i64, iv: f64) -> Option<f64> {
+        let trade = self.position.as_ref()?;
+        if trade.direction == "SPREAD" {
+            let mut current_value = 0.0;
+            for leg in &trade.legs {
+                let greeks_price = if leg.option_type == "EQ" {
+                    close
+                } else {
+                    let is_call = leg.option_type == "CE";
+                    let t = thursday_t(timestamp);
+                    let greeks = calculate_greeks(
+                        close,
+                        leg.strike,
+                        t,
+                        self.params.risk_free_rate,
+                        iv,
+                        is_call,
+                    );
+                    greeks.price
+                };
+                if leg.action == "SELL" {
+                    current_value += greeks_price;
+                } else {
+                    current_value -= greeks_price;
+                }
+            }
+            Some((trade.entry_price - current_value) * trade.quantity as f64 * self.params.lot_size)
+        } else {
+            Some((close - trade.entry_price) * trade.quantity as f64)
+        }
     }
 
     fn process_signal(&mut self, signal: Signal, timestamp: i64, price: f64, iv: f64) {
@@ -302,21 +318,7 @@ impl BacktestEngine {
                     price
                 } else {
                     let is_call = signal_leg.option_type == "CE";
-                    use chrono::Datelike;
-                    let dt = chrono::DateTime::from_timestamp(timestamp, 0)
-                        .unwrap_or_default()
-                        .naive_utc();
-                    let mut days_to_expiry = 0.0;
-                    let mut current_date = dt.date();
-                    while current_date.weekday() != chrono::Weekday::Thu {
-                        current_date = current_date.succ_opt().unwrap();
-                        days_to_expiry += 1.0;
-                    }
-                    if days_to_expiry == 0.0 {
-                        days_to_expiry = 0.1;
-                    } // 0 DTE
-
-                    let t = days_to_expiry / 365.0;
+                    let t = thursday_t(timestamp);
                     let r = self.params.risk_free_rate;
                     let sigma = iv;
 
@@ -438,21 +440,7 @@ impl BacktestEngine {
                         price
                     } else {
                         let is_call = leg.option_type == "CE";
-                        use chrono::Datelike;
-                        let dt = chrono::DateTime::from_timestamp(timestamp, 0)
-                            .unwrap_or_default()
-                            .naive_utc();
-                        let mut days_to_expiry = 0.0;
-                        let mut current_date = dt.date();
-                        while current_date.weekday() != chrono::Weekday::Thu {
-                            current_date = current_date.succ_opt().unwrap();
-                            days_to_expiry += 1.0;
-                        }
-                        if days_to_expiry == 0.0 {
-                            days_to_expiry = 0.1;
-                        } // 0 DTE
-
-                        let t = days_to_expiry / 365.0;
+                        let t = thursday_t(timestamp);
                         let r = self.params.risk_free_rate;
                         let sigma = iv;
                         let greeks = calculate_greeks(price, leg.strike, t, r, sigma, is_call);
@@ -503,6 +491,24 @@ impl BacktestEngine {
             }
         }
     }
+}
+
+/// Years to the next Thursday expiry (SP1 keeps the v0.1 calendar; SP3 generalizes).
+fn thursday_t(timestamp: i64) -> f64 {
+    use chrono::Datelike;
+    let dt = chrono::DateTime::from_timestamp(timestamp, 0)
+        .unwrap_or_default()
+        .naive_utc();
+    let mut days = 0.0;
+    let mut d = dt.date();
+    while d.weekday() != chrono::Weekday::Thu {
+        d = d.succ_opt().unwrap();
+        days += 1.0;
+    }
+    if days == 0.0 {
+        days = 0.1;
+    }
+    days / 365.0
 }
 
 #[cfg(test)]
