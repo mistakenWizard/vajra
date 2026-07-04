@@ -203,6 +203,10 @@ impl BacktestEngine {
                     let fill_px = self.fill_underlying_px(i, open, high, low, close);
                     self.process_signal(signal, timestamp, fill_px, iv);
                 } else {
+                    debug_assert!(
+                        pending.is_none(),
+                        "overwriting an unresolved pending fill: single-position engine assumes fill models resolve within one bar (fill_bar <= decision_i + 1)"
+                    );
                     pending = Some(Pending {
                         signal,
                         fill_bar: fb,
