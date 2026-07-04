@@ -1,6 +1,7 @@
 use polars::prelude::*;
 use std::collections::HashMap;
 use vajra::engine::{BacktestEngine, OptionLeg, Signal, SignalAction, Strategy};
+use vajra::marketdata::MapOptionSource;
 use vajra::strategies::MovingAverageCrossover;
 
 fn load(path: &str) -> DataFrame {
@@ -112,6 +113,40 @@ fn golden_options_next_bar_open() {
     );
     // CAPTURE-THEN-FREEZE: captured and frozen.
     assert!((pnl - -1253.8012142416735).abs() < 1e-6, "pnl was {pnl}");
+}
+
+#[test]
+fn real_quote_marks_from_quote_not_bs() {
+    let df = load("tests/fixtures/eq_ohlcv.csv");
+    let opt = load("tests/fixtures/opt_long.csv");
+    let source = MapOptionSource::from_long_df(&opt).unwrap();
+    let mut strat = FixedStraddle { bar: 0 };
+    strat.init(&HashMap::new());
+    let mut engine = BacktestEngine::new(300_000.0)
+        .with_fill_model(Box::new(vajra::fill::SameBarClose))
+        .with_option_source(Box::new(source));
+    let trades = engine.run(&df, &mut strat).unwrap();
+    assert_eq!(trades.len(), 1);
+    // All 4 leg fills (2 open + 2 close) came from real quotes, not BS.
+    assert_eq!(engine.modeled_fills(), 0, "expected all fills from quotes");
+    let pnl = trades[0].pnl.unwrap();
+    assert!(
+        (pnl - -1244.091014149768).abs() > 1e-6,
+        "pnl should reflect real quotes, got {pnl}"
+    );
+}
+
+#[test]
+fn modeled_fills_counts_bs_fallback() {
+    // No option source: every option leg falls back to BS. Straddle = 2 legs
+    // on open + 2 on close = 4 modeled fills.
+    let df = load("tests/fixtures/eq_ohlcv.csv");
+    let mut strat = FixedStraddle { bar: 0 };
+    strat.init(&HashMap::new());
+    let mut engine =
+        BacktestEngine::new(300_000.0).with_fill_model(Box::new(vajra::fill::SameBarClose));
+    let _ = engine.run(&df, &mut strat).unwrap();
+    assert_eq!(engine.modeled_fills(), 4);
 }
 
 // A strategy that opens on the LAST bar cannot fill (no t+1) — position stays open.

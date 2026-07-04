@@ -97,6 +97,7 @@ pub struct BacktestEngine {
     cost: Box<dyn crate::cost::CostModel>,
     fill_model: Box<dyn FillModel>,
     modeled_fills: usize,
+    option_source: Option<Box<dyn crate::marketdata::OptionQuoteSource>>,
 }
 
 impl BacktestEngine {
@@ -109,6 +110,7 @@ impl BacktestEngine {
             cost: Box::new(crate::cost::IndiaOptionsCost),
             fill_model: Box::new(NextBarOpen),
             modeled_fills: 0,
+            option_source: None,
         }
     }
 
@@ -121,6 +123,7 @@ impl BacktestEngine {
             cost,
             fill_model: Box::new(NextBarOpen),
             modeled_fills: 0,
+            option_source: None,
         }
     }
 
@@ -131,6 +134,11 @@ impl BacktestEngine {
 
     pub fn with_fill_model(mut self, m: Box<dyn FillModel>) -> Self {
         self.fill_model = m;
+        self
+    }
+
+    pub fn with_option_source(mut self, s: Box<dyn crate::marketdata::OptionQuoteSource>) -> Self {
+        self.option_source = Some(s);
         self
     }
 
@@ -216,6 +224,40 @@ impl BacktestEngine {
         }
 
         Ok(self.trades.clone())
+    }
+
+    /// Price one option leg at its fill bar: real quote if available, else
+    /// Black-Scholes (counted via `modeled_fills`). Returns the pre-slippage
+    /// price and the quoted spread (`ask - bid`) when a real quote was used.
+    fn price_leg(
+        &mut self,
+        strike: f64,
+        option_type: &str,
+        underlying_px: f64,
+        timestamp: i64,
+        iv: f64,
+    ) -> (f64, Option<f64>) {
+        let key = crate::marketdata::InstrumentKey {
+            strike,
+            option_type: option_type.to_string(),
+        };
+        if let Some(src) = &self.option_source {
+            if let Some(q) = src.option_quote(&key, timestamp) {
+                return (self.fill_model.quote_price(&q), q.spread());
+            }
+        }
+        let is_call = option_type == "CE";
+        let t = thursday_t(timestamp);
+        let g = calculate_greeks(
+            underlying_px,
+            strike,
+            t,
+            self.params.risk_free_rate,
+            iv,
+            is_call,
+        );
+        self.modeled_fills += 1;
+        (g.price, None)
     }
 
     fn fill_underlying_px(&self, _i: usize, open: f64, high: f64, low: f64, close: f64) -> f64 {
@@ -318,23 +360,24 @@ impl BacktestEngine {
             let mut all_legs: Vec<OptionLeg> = Vec::new();
 
             for signal_leg in signal_legs {
-                let mut entry_price = if signal_leg.option_type == "EQ" {
-                    price
+                let (mut entry_price, spread) = if signal_leg.option_type == "EQ" {
+                    (price, None)
                 } else {
-                    let is_call = signal_leg.option_type == "CE";
-                    let t = thursday_t(timestamp);
-                    let r = self.params.risk_free_rate;
-                    let sigma = iv;
-
-                    let greeks = calculate_greeks(price, signal_leg.strike, t, r, sigma, is_call);
-                    greeks.price
+                    self.price_leg(
+                        signal_leg.strike,
+                        &signal_leg.option_type,
+                        price,
+                        timestamp,
+                        iv,
+                    )
                 };
 
-                entry_price = self.cost.adjust_fill(
+                entry_price = self.cost.adjust_fill_spread(
                     entry_price,
                     &signal_leg.action,
                     signal_leg.option_type != "EQ",
                     false,
+                    spread,
                 );
 
                 let calculated_leg = OptionLeg {
@@ -440,24 +483,27 @@ impl BacktestEngine {
                 let mut current_net_premium = 0.0;
 
                 for leg in &mut trade.legs {
-                    let mut exit_price = if leg.option_type == "EQ" {
-                        price
+                    let strike = leg.strike;
+                    let otype = leg.option_type.clone();
+                    let (mut exit_price, spread) = if otype == "EQ" {
+                        (price, None)
                     } else {
-                        let is_call = leg.option_type == "CE";
-                        let t = thursday_t(timestamp);
-                        let r = self.params.risk_free_rate;
-                        let sigma = iv;
-                        let greeks = calculate_greeks(price, leg.strike, t, r, sigma, is_call);
-                        greeks.price
+                        self.price_leg(strike, &otype, price, timestamp, iv)
                     };
 
                     // Exit Slippage
-                    if leg.option_type == "EQ" {
+                    if otype == "EQ" {
                         // vajra: preserves double-slippage bug from source; fix post-extraction
                         exit_price = self.cost.adjust_fill(exit_price, &leg.action, false, true);
                         exit_price = self.cost.adjust_fill(exit_price, &leg.action, false, true);
                     } else {
-                        exit_price = self.cost.adjust_fill(exit_price, &leg.action, true, true);
+                        exit_price = self.cost.adjust_fill_spread(
+                            exit_price,
+                            &leg.action,
+                            true,
+                            true,
+                            spread,
+                        );
                     }
 
                     leg.exit_price = Some(exit_price);
