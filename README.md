@@ -51,6 +51,31 @@ For realistic pricing, add an `iv` column to your bar `DataFrame` — the engine
 reads per-bar implied vol from it and only falls back to the flat assumption
 when the column is absent.
 
+### Execution & real-quote marking
+
+By default the engine fills **lookahead-free**: a decision on bar *t* fills at
+*t+1*'s open (`NextBarOpen`). For bit-identical reproduction of pre-0.x runs,
+opt into the old same-bar-close fill:
+
+```rust
+let engine = BacktestEngine::new(capital)
+    .with_fill_model(Box::new(vajra::fill::SameBarClose));
+```
+
+Option legs are marked from **real quotes** when you supply them, and only fall
+back to Black-Scholes otherwise:
+
+```rust
+let opt = CsvDataLoader::new().from_path("option_quotes.csv")?; // long format
+let source = vajra::marketdata::MapOptionSource::from_long_df(&opt)?;
+let engine = BacktestEngine::new(capital).with_option_source(Box::new(source));
+```
+
+Long-format columns: `timestamp,strike,option_type,open,high,low,close` plus
+optional `bid,ask` (spread widens slippage). After a run,
+`engine.modeled_fills()` returns how many option legs used the BS fallback — a
+backtest fed complete quotes reports `0`.
+
 ## Status
 
 **v0.1 — API unstable.** Extracted from a private trading stack and still
