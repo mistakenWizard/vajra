@@ -1,5 +1,7 @@
 //! Market-data types and the option-quote overlay used for real-quote marking.
 
+use std::collections::HashMap;
+
 /// A real option (or underlying) quote at one bar.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Quote {
@@ -45,6 +47,62 @@ impl std::hash::Hash for InstrumentKey {
 /// `None` ⇒ the engine falls back to Black-Scholes model pricing (counted).
 pub trait OptionQuoteSource: Send {
     fn option_quote(&self, key: &InstrumentKey, bar_ts: i64) -> Option<Quote>;
+}
+
+/// In-memory `OptionQuoteSource` keyed by `(bar_ts, InstrumentKey)`.
+#[derive(Default)]
+pub struct MapOptionSource {
+    quotes: HashMap<(i64, InstrumentKey), Quote>,
+}
+
+impl MapOptionSource {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, bar_ts: i64, key: InstrumentKey, q: Quote) {
+        self.quotes.insert((bar_ts, key), q);
+    }
+
+    /// Build from a long-format option DataFrame (one row per bar×strike×type).
+    pub fn from_long_df(df: &polars::prelude::DataFrame) -> anyhow::Result<Self> {
+        let ts = df.column("timestamp")?.str()?;
+        let strike = df.column("strike")?.f64()?;
+        let otype = df.column("option_type")?.str()?;
+        let open = df.column("open")?.f64()?;
+        let high = df.column("high")?.f64()?;
+        let low = df.column("low")?.f64()?;
+        let close = df.column("close")?.f64()?;
+        let bid = df.column("bid").ok().and_then(|c| c.f64().ok());
+        let ask = df.column("ask").ok().and_then(|c| c.f64().ok());
+
+        let mut s = Self::new();
+        for i in 0..df.height() {
+            let dt = chrono::NaiveDateTime::parse_from_str(ts.get(i).unwrap(), "%Y-%m-%d %H:%M:%S")
+                .unwrap_or_default();
+            let bar_ts = dt.and_utc().timestamp();
+            let key = InstrumentKey {
+                strike: strike.get(i).unwrap(),
+                option_type: otype.get(i).unwrap().to_string(),
+            };
+            let q = Quote {
+                open: open.get(i).unwrap(),
+                high: high.get(i).unwrap(),
+                low: low.get(i).unwrap(),
+                close: close.get(i).unwrap(),
+                bid: bid.and_then(|c| c.get(i)),
+                ask: ask.and_then(|c| c.get(i)),
+            };
+            s.insert(bar_ts, key, q);
+        }
+        Ok(s)
+    }
+}
+
+impl OptionQuoteSource for MapOptionSource {
+    fn option_quote(&self, key: &InstrumentKey, bar_ts: i64) -> Option<Quote> {
+        self.quotes.get(&(bar_ts, key.clone())).copied()
+    }
 }
 
 #[cfg(test)]
@@ -95,5 +153,30 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn map_source_returns_inserted_quote() {
+        let mut s = MapOptionSource::new();
+        let key = InstrumentKey {
+            strike: 22100.0,
+            option_type: "CE".into(),
+        };
+        let q = Quote {
+            open: 5.0,
+            high: 6.0,
+            low: 4.0,
+            close: 5.5,
+            bid: None,
+            ask: None,
+        };
+        s.insert(1000, key.clone(), q);
+        assert_eq!(s.option_quote(&key, 1000), Some(q));
+        assert_eq!(s.option_quote(&key, 2000), None); // wrong ts
+        let pe = InstrumentKey {
+            strike: 22100.0,
+            option_type: "PE".into(),
+        };
+        assert_eq!(s.option_quote(&pe, 1000), None); // wrong type
     }
 }
