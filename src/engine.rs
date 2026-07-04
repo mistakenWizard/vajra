@@ -1,3 +1,4 @@
+use crate::fill::{BarField, FillModel, NextBarOpen};
 use crate::greeks::calculate_greeks;
 use anyhow::Result;
 use polars::prelude::*;
@@ -94,6 +95,8 @@ pub struct BacktestEngine {
     position: Option<Trade>,
     trades: Vec<Trade>,
     cost: Box<dyn crate::cost::CostModel>,
+    fill_model: Box<dyn FillModel>,
+    modeled_fills: usize,
 }
 
 impl BacktestEngine {
@@ -104,6 +107,8 @@ impl BacktestEngine {
             position: None,
             trades: Vec::new(),
             cost: Box::new(crate::cost::IndiaOptionsCost),
+            fill_model: Box::new(NextBarOpen),
+            modeled_fills: 0,
         }
     }
 
@@ -114,12 +119,25 @@ impl BacktestEngine {
             position: None,
             trades: Vec::new(),
             cost,
+            fill_model: Box::new(NextBarOpen),
+            modeled_fills: 0,
         }
     }
 
     pub fn with_params(mut self, params: FinancialParams) -> Self {
         self.params = params;
         self
+    }
+
+    pub fn with_fill_model(mut self, m: Box<dyn FillModel>) -> Self {
+        self.fill_model = m;
+        self
+    }
+
+    /// How many option legs were priced via the Black-Scholes fallback
+    /// (i.e. had no real quote) across the last `run`.
+    pub fn modeled_fills(&self) -> usize {
+        self.modeled_fills
     }
 
     pub fn run(&mut self, df: &DataFrame, strategy: &mut dyn Strategy) -> Result<Vec<Trade>> {
@@ -203,10 +221,18 @@ impl BacktestEngine {
                 None
             };
 
+            // Underlying price the fill model marks against (SameBarClose => close, today's behavior).
+            let fill_px = match self.fill_model.underlying_field() {
+                BarField::Open => open,
+                BarField::High => high,
+                BarField::Low => low,
+                BarField::Close => close,
+            };
+
             if let Some(signal) =
                 strategy.on_bar(timestamp, open, high, low, close, volume, current_pnl)
             {
-                self.process_signal(signal, timestamp, close, iv);
+                self.process_signal(signal, timestamp, fill_px, iv);
             }
         }
 

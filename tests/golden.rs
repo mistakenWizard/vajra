@@ -16,7 +16,8 @@ fn golden_equity_ma_crossover() {
     let df = load("tests/fixtures/eq_ohlcv.csv");
     let mut strat = MovingAverageCrossover::new();
     strat.init(&HashMap::new());
-    let mut engine = BacktestEngine::new(100_000.0);
+    let mut engine =
+        BacktestEngine::new(100_000.0).with_fill_model(Box::new(vajra::fill::SameBarClose));
     let trades = engine.run(&df, &mut strat).unwrap();
 
     // CAPTURE-THEN-FREEZE: run once, read the actual values from the failure,
@@ -86,7 +87,8 @@ fn golden_options_fixed_straddle() {
     // Naked-sell margin floor is 150_000/lot (SEBI floor path in handle_open_position);
     // 100_000 capital would round quantity to 0 and never open a position, so this
     // test uses a larger capital base than the equity golden test.
-    let mut engine = BacktestEngine::new(300_000.0);
+    let mut engine =
+        BacktestEngine::new(300_000.0).with_fill_model(Box::new(vajra::fill::SameBarClose));
     let trades = engine.run(&df, &mut strat).unwrap();
     assert_eq!(trades.len(), 1);
     let pnl = trades[0].pnl.unwrap();
