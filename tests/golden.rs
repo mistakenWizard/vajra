@@ -1,6 +1,7 @@
 use polars::prelude::*;
 use std::collections::HashMap;
 use vajra::engine::{BacktestEngine, OptionLeg, Signal, SignalAction, Strategy};
+use vajra::marketdata::MapOptionSource;
 use vajra::strategies::MovingAverageCrossover;
 
 fn load(path: &str) -> DataFrame {
@@ -16,7 +17,8 @@ fn golden_equity_ma_crossover() {
     let df = load("tests/fixtures/eq_ohlcv.csv");
     let mut strat = MovingAverageCrossover::new();
     strat.init(&HashMap::new());
-    let mut engine = BacktestEngine::new(100_000.0);
+    let mut engine =
+        BacktestEngine::new(100_000.0).with_fill_model(Box::new(vajra::fill::SameBarClose));
     let trades = engine.run(&df, &mut strat).unwrap();
 
     // CAPTURE-THEN-FREEZE: run once, read the actual values from the failure,
@@ -86,9 +88,119 @@ fn golden_options_fixed_straddle() {
     // Naked-sell margin floor is 150_000/lot (SEBI floor path in handle_open_position);
     // 100_000 capital would round quantity to 0 and never open a position, so this
     // test uses a larger capital base than the equity golden test.
-    let mut engine = BacktestEngine::new(300_000.0);
+    let mut engine =
+        BacktestEngine::new(300_000.0).with_fill_model(Box::new(vajra::fill::SameBarClose));
     let trades = engine.run(&df, &mut strat).unwrap();
     assert_eq!(trades.len(), 1);
     let pnl = trades[0].pnl.unwrap();
     assert!((pnl - -1244.091014149768).abs() < 1e-6, "pnl was {pnl}"); // capture-then-freeze
+}
+
+#[test]
+fn golden_options_next_bar_open() {
+    let df = load("tests/fixtures/eq_ohlcv.csv");
+    let mut strat = FixedStraddle { bar: 0 };
+    strat.init(&HashMap::new());
+    // Default fill model is NextBarOpen; assert the number DIFFERS from the
+    // SameBarClose golden (-1244.091...), proving lookahead was removed.
+    let mut engine = BacktestEngine::new(300_000.0);
+    let trades = engine.run(&df, &mut strat).unwrap();
+    assert_eq!(trades.len(), 1);
+    let pnl = trades[0].pnl.unwrap();
+    assert!(
+        (pnl - -1244.091014149768).abs() > 1e-6,
+        "expected a different fill than SameBarClose, got {pnl}"
+    );
+    // CAPTURE-THEN-FREEZE: captured and frozen.
+    assert!((pnl - -1253.8012142416735).abs() < 1e-6, "pnl was {pnl}");
+}
+
+#[test]
+fn real_quote_marks_from_quote_not_bs() {
+    let df = load("tests/fixtures/eq_ohlcv.csv");
+    let opt = load("tests/fixtures/opt_long.csv");
+    let source = MapOptionSource::from_long_df(&opt).unwrap();
+    let mut strat = FixedStraddle { bar: 0 };
+    strat.init(&HashMap::new());
+    let mut engine = BacktestEngine::new(300_000.0)
+        .with_fill_model(Box::new(vajra::fill::SameBarClose))
+        .with_option_source(Box::new(source));
+    let trades = engine.run(&df, &mut strat).unwrap();
+    assert_eq!(trades.len(), 1);
+    // All 4 leg fills (2 open + 2 close) came from real quotes, not BS.
+    assert_eq!(engine.modeled_fills(), 0, "expected all fills from quotes");
+    let pnl = trades[0].pnl.unwrap();
+    assert!(
+        (pnl - -1244.091014149768).abs() > 1e-6,
+        "pnl should reflect real quotes, got {pnl}"
+    );
+}
+
+#[test]
+fn modeled_fills_counts_bs_fallback() {
+    // No option source: every option leg falls back to BS. Straddle = 2 legs
+    // on open + 2 on close = 4 modeled fills.
+    let df = load("tests/fixtures/eq_ohlcv.csv");
+    let mut strat = FixedStraddle { bar: 0 };
+    strat.init(&HashMap::new());
+    let mut engine =
+        BacktestEngine::new(300_000.0).with_fill_model(Box::new(vajra::fill::SameBarClose));
+    let _ = engine.run(&df, &mut strat).unwrap();
+    assert_eq!(engine.modeled_fills(), 4);
+}
+
+// A strategy that opens on the LAST bar cannot fill (no t+1) — position stays open.
+struct OpenOnLastBar {
+    n: usize,
+    i: usize,
+}
+impl Strategy for OpenOnLastBar {
+    fn init(&mut self, _p: &HashMap<String, serde_json::Value>) {}
+    fn on_bar(
+        &mut self,
+        _ts: i64,
+        _o: f64,
+        _h: f64,
+        _l: f64,
+        c: f64,
+        _v: f64,
+        _pnl: Option<f64>,
+    ) -> Option<Signal> {
+        self.i += 1;
+        if self.i == self.n {
+            let atm = (c / 100.0).round() * 100.0;
+            return Some(Signal {
+                action: SignalAction::OpenPosition {
+                    legs: vec![OptionLeg {
+                        strike: atm,
+                        option_type: "CE".into(),
+                        entry_price: 0.0,
+                        exit_price: None,
+                        action: "SELL".into(),
+                        expiry_days: Some(7.0),
+                    }],
+                    expiry_days: Some(7.0),
+                },
+            });
+        }
+        None
+    }
+}
+
+#[test]
+fn next_bar_open_has_no_lookahead() {
+    // A decision on the final bar has no next bar to fill at: it must NOT fill
+    // at that bar's own close (which would be lookahead). No trade is recorded.
+    let df = load("tests/fixtures/eq_ohlcv.csv");
+    let n = df.height();
+    let mut strat = OpenOnLastBar { n, i: 0 };
+    strat.init(&HashMap::new());
+    let mut engine = BacktestEngine::new(300_000.0); // NextBarOpen default
+    let trades = engine.run(&df, &mut strat).unwrap();
+    // Position opened on the last bar can't fill forward; nothing closes => no completed trade.
+    assert_eq!(
+        trades.len(),
+        0,
+        "last-bar decision must not fill via lookahead"
+    );
 }
